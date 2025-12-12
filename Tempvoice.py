@@ -1,6 +1,8 @@
 import discord
 from discord.ext import commands
 import asyncio
+import json
+import os
 
 intents = discord.Intents.default()
 intents.members = True
@@ -16,13 +18,27 @@ TEMP_CATEGORY_ID = 1449139868339929088
 INTERFACE_CATEGORY_ID = 1449139075465482261
 TEMP_PREFIX = "Temp"
 AUTO_DELETE_DELAY = 5
+JSON_FILE = "vc_data.json"
 # ==================
 
+# --- Global variables ---
 temp_channels = {}
-channel_owners = {}
 interface_channels = {}
-trusted_users = {}
 vc_join_order = {}
+user_vc_names = {}
+vc_data = {}
+# =========================
+
+# Load JSON if exists
+if os.path.exists(JSON_FILE):
+    with open(JSON_FILE, "r") as f:
+        data = json.load(f)
+        user_vc_names = data.get("user_vc_names", {})
+        vc_data = data.get("vc_data", {})
+
+def save_json():
+    with open(JSON_FILE, "w") as f:
+        json.dump({"user_vc_names": user_vc_names, "vc_data": vc_data}, f, indent=4)
 
 # ---------- Modals ----------
 class RenameModal(discord.ui.Modal, title="Rename your temp channel"):
@@ -33,8 +49,19 @@ class RenameModal(discord.ui.Modal, title="Rename your temp channel"):
         self.add_item(self.name_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.vc.edit(name=self.name_input.value)
-        await interaction.response.send_message(f"Renamed channel to **{self.name_input.value}**", ephemeral=True)
+        new_name = self.name_input.value
+        owner_id = vc_data[str(self.vc.id)]["owner"]
+        await self.vc.edit(name=new_name)
+        vc_data[str(self.vc.id)]["name"] = new_name
+        user_vc_names[str(owner_id)] = new_name
+        save_json()
+
+        # Rename waiting rooms if any
+        for ch in self.vc.guild.voice_channels:
+            if ch.name.startswith(f"{self.vc.name} waiting room"):
+                await ch.edit(name=f"{new_name} waiting room")
+
+        await interaction.response.send_message(f"Renamed channel to **{new_name}**", ephemeral=True)
 
 class LimitModal(discord.ui.Modal, title="Set user limit"):
     def __init__(self, vc: discord.VoiceChannel):
@@ -47,6 +74,8 @@ class LimitModal(discord.ui.Modal, title="Set user limit"):
         try:
             limit = int(self.limit_input.value)
             await self.vc.edit(user_limit=limit)
+            vc_data[str(self.vc.id)]["user_limit"] = limit
+            save_json()
             await interaction.response.send_message(f"Set channel limit to {limit}", ephemeral=True)
         except ValueError:
             await interaction.response.send_message("Invalid number!", ephemeral=True)
@@ -67,9 +96,10 @@ class TrustModal(discord.ui.Modal, title="Trust a user"):
             overwrites = self.vc.overwrites_for(user)
             overwrites.connect = True
             await self.vc.set_permissions(user, overwrite=overwrites)
-            trusted_users.setdefault(self.vc.id, [])
-            if user.id not in trusted_users[self.vc.id]:
-                trusted_users[self.vc.id].append(user.id)
+            trusted = vc_data[str(self.vc.id)]["trusted_users"]
+            if user.id not in trusted:
+                trusted.append(user.id)
+            save_json()
             await interaction.response.send_message(f"{user.mention} is now trusted.", ephemeral=True)
         except:
             await interaction.response.send_message("Invalid ID.", ephemeral=True)
@@ -84,11 +114,13 @@ class UntrustModal(discord.ui.Modal, title="Untrust a user"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             user_id = int(self.user_input.value)
-            if self.vc.id in trusted_users and user_id in trusted_users[self.vc.id]:
-                trusted_users[self.vc.id].remove(user_id)
-                user = interaction.guild.get_member(user_id)
-                if user:
-                    await self.vc.set_permissions(user, overwrite=None)
+            trusted = vc_data[str(self.vc.id)]["trusted_users"]
+            if user_id in trusted:
+                trusted.remove(user_id)
+                member = interaction.guild.get_member(user_id)
+                if member:
+                    await self.vc.set_permissions(member, overwrite=None)
+                save_json()
                 await interaction.response.send_message(f"<@{user_id}> has been untrusted.", ephemeral=True)
             else:
                 await interaction.response.send_message("That user is not trusted.", ephemeral=True)
@@ -101,6 +133,7 @@ class TransferModal(discord.ui.Modal, title="Transfer ownership"):
         self.vc = vc
         self.user_input = discord.ui.TextInput(label="User ID to transfer ownership to", placeholder="123456789012345678")
         self.add_item(self.user_input)
+        self.view = None
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -108,8 +141,10 @@ class TransferModal(discord.ui.Modal, title="Transfer ownership"):
             user = interaction.guild.get_member(user_id)
             if not user:
                 return await interaction.response.send_message("User not found.", ephemeral=True)
+            vc_data[str(self.vc.id)]["owner"] = user.id
+            user_vc_names[str(user.id)] = self.vc.name
             temp_channels[self.vc.id] = user.id
-            channel_owners[user.id] = self.vc.id
+            save_json()
             self.view.owner_id = user.id
             await interaction.response.send_message(f"Ownership transferred to {user.mention}", ephemeral=True)
             await self.view.update_message()
@@ -131,14 +166,12 @@ class TempChannelView(discord.ui.View):
         return False
 
     async def update_message(self):
+        data = vc_data[str(self.vc.id)]
         members = len(self.vc.members)
-        locked = "🔒" if self.vc.overwrites_for(self.vc.guild.default_role).connect is False else "🔓"
-        trusted = trusted_users.get(self.vc.id, [])
+        locked = "🔒" if data["locked"] else "🔓"
+        trusted = data["trusted_users"]
         trusted_mentions = ", ".join(f"<@{u}>" for u in trusted) if trusted else "None"
-        content = (
-            f"**{self.vc.name}** — Owner: <@{self.owner_id}> | Members: {members} | {locked}\n"
-            f"Trusted users: {trusted_mentions}"
-        )
+        content = f"**{data['name']}** — Owner: <@{self.owner_id}> | Members: {members} | {locked}\nTrusted users: {trusted_mentions}"
 
         if isinstance(self.message, discord.Message):
             try:
@@ -164,13 +197,10 @@ class TempChannelView(discord.ui.View):
 
     @discord.ui.button(label="Lock/Unlock", style=discord.ButtonStyle.danger)
     async def privacy_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = self.vc.guild
-        overwrites = self.vc.overwrites_for(guild.default_role)
-        if overwrites.connect is False:
-            await self.vc.set_permissions(guild.default_role, connect=True)
-        else:
-            await self.vc.set_permissions(guild.default_role, connect=False)
-        await interaction.response.send_message("Privacy toggled.", ephemeral=True)
+        data = vc_data[str(self.vc.id)]
+        data["locked"] = not data["locked"]
+        save_json()
+        await interaction.response.send_message(f"Channel {'locked' if data['locked'] else 'unlocked'}.", ephemeral=True)
         await self.update_message()
 
     @discord.ui.button(label="Kick", style=discord.ButtonStyle.danger)
@@ -183,17 +213,16 @@ class TempChannelView(discord.ui.View):
 
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        owner_id = temp_channels.pop(self.vc.id, None)
-        if owner_id:
-            channel_owners.pop(owner_id, None)
-            trusted_users.pop(self.vc.id, None)
-            vc_join_order.pop(self.vc.id, None)
-            interface_channel = interface_channels.pop(self.vc.id, None)
-            if interface_channel:
-                try:
-                    await interface_channel.delete()
-                except:
-                    pass
+        vc_id = self.vc.id
+        temp_channels.pop(vc_id, None)
+        interface_channel = interface_channels.pop(vc_id, None)
+        if interface_channel:
+            try:
+                await interface_channel.delete()
+            except:
+                pass
+        vc_data.pop(str(vc_id), None)
+        save_json()
         await self.vc.delete()
         await interaction.response.send_message("Channel deleted!", ephemeral=True)
 
@@ -216,29 +245,42 @@ class TempChannelView(discord.ui.View):
 # ---------- Voice State Update ----------
 @bot.event
 async def on_voice_state_update(member, before, after):
+    guild = member.guild
+
+    # --- User joins lobby VC to create temp VC ---
     if after.channel and after.channel.id in LOBBY_VC_IDS:
-        guild = member.guild
-        category = guild.get_channel(TEMP_CATEGORY_ID) if TEMP_CATEGORY_ID else None
+        category = guild.get_channel(TEMP_CATEGORY_ID)
         interface_category = guild.get_channel(INTERFACE_CATEGORY_ID)
-
         existing_numbers = [int(ch.name.split("#")[-1])
-                            for ch in category.voice_channels if ch.name.startswith(TEMP_PREFIX) and ch.name.split("#")[-1].isdigit()] \
-            if category else []
-
+                            for ch in category.voice_channels
+                            if ch.name.startswith(TEMP_PREFIX) and ch.name.split("#")[-1].isdigit()] if category else []
         number = max(existing_numbers, default=0) + 1
-        temp_name = f"{TEMP_PREFIX} #{number}"
 
+        # Use last name if available
+        saved_name = user_vc_names.get(str(member.id))
+        temp_name = saved_name or f"{TEMP_PREFIX} #{number}"
         temp_channel = await guild.create_voice_channel(name=temp_name, category=category)
 
         temp_channels[temp_channel.id] = member.id
-        channel_owners[member.id] = temp_channel.id
         vc_join_order[temp_channel.id] = [member.id]
+
+        vc_data[str(temp_channel.id)] = {
+            "owner": member.id,
+            "trusted_users": [],
+            "locked": False,
+            "user_limit": 0,
+            "name": temp_name
+        }
+        user_vc_names[str(member.id)] = temp_name
+        save_json()
+
         await member.move_to(temp_channel)
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             member: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
+
         interface_channel = await guild.create_text_channel(
             name=f"interface-{number}",
             category=interface_category,
@@ -249,12 +291,29 @@ async def on_voice_state_update(member, before, after):
         view = TempChannelView(member.id, temp_channel, message=interface_channel)
         await view.update_message()
 
+    # --- Handle joining a temp VC ---
     if after.channel and after.channel.id in temp_channels:
-        if after.channel.id not in vc_join_order:
-            vc_join_order[after.channel.id] = []
-        if member.id not in vc_join_order[after.channel.id]:
-            vc_join_order[after.channel.id].append(member.id)
+        vc_id = after.channel.id
+        data = vc_data.get(str(vc_id), {})
+        locked = data.get("locked", False)
+        if locked and member.id != data.get("owner") and member.id not in data.get("trusted_users", []):
+            waiting_name = f"{data['name']} waiting room"
+            category = after.channel.category
+            waiting_room = await guild.create_voice_channel(name=waiting_name, category=category)
+            await member.move_to(waiting_room)
+            async def delete_waiting():
+                await asyncio.sleep(60)
+                if len(waiting_room.members) == 0:
+                    await waiting_room.delete()
+            asyncio.create_task(delete_waiting())
+            return
 
+        if vc_id not in vc_join_order:
+            vc_join_order[vc_id] = []
+        if member.id not in vc_join_order[vc_id]:
+            vc_join_order[vc_id].append(member.id)
+
+    # --- Handle leaving temp VC ---
     if before.channel and before.channel.id in temp_channels:
         vc_id = before.channel.id
         owner_id = temp_channels.get(vc_id)
@@ -267,32 +326,58 @@ async def on_voice_state_update(member, before, after):
             ch = before.channel
             if ch:
                 if len(ch.members) == 0:
-                    owner_id = temp_channels.pop(vc_id, None)
-                    if owner_id:
-                        channel_owners.pop(owner_id, None)
-                        trusted_users.pop(vc_id, None)
-                        vc_join_order.pop(vc_id, None)
-                        interface_channel = interface_channels.pop(vc_id, None)
-                        if interface_channel:
-                            try:
-                                await interface_channel.delete()
-                            except:
-                                pass
+                    temp_channels.pop(vc_id, None)
+                    vc_join_order.pop(vc_id, None)
+                    vc_data.pop(str(vc_id), None)
+                    save_json()
+                    interface_channel = interface_channels.pop(vc_id, None)
+                    if interface_channel:
+                        try:
+                            await interface_channel.delete()
+                        except:
+                            pass
                     await ch.delete()
                 elif owner_id == member.id and len(ch.members) > 0:
                     new_owner_id = vc_join_order[vc_id][0]
                     temp_channels[vc_id] = new_owner_id
-                    channel_owners[new_owner_id] = vc_id
+                    vc_data[str(vc_id)]["owner"] = new_owner_id
+                    user_vc_names[str(new_owner_id)] = vc_data[str(vc_id)]["name"]
+                    save_json()
                     interface_channel = interface_channels.get(vc_id)
                     if interface_channel:
                         view = TempChannelView(new_owner_id, ch, message=interface_channel)
                         await view.update_message()
-
         asyncio.create_task(delete_if_empty_or_transfer())
 
 # ---------- On Ready ----------
 @bot.event
 async def on_ready():
     print(f"Bot is online as {bot.user}!")
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        print("Guild not found!")
+        return
+
+    # Restore temp channels
+    for vc_id_str, data in vc_data.items():
+        vc_id = int(vc_id_str)
+        channel = guild.get_channel(vc_id)
+        if channel:
+            temp_channels[vc_id] = data["owner"]
+            interface_channel = interface_channels.get(vc_id)
+            if not interface_channel:
+                interface_category = guild.get_channel(INTERFACE_CATEGORY_ID)
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    guild.get_member(data["owner"]): discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                }
+                interface_channel = await guild.create_text_channel(
+                    name=f"interface-{channel.name}",
+                    category=interface_category,
+                    overwrites=overwrites
+                )
+                interface_channels[vc_id] = interface_channel
+            view = TempChannelView(data["owner"], channel, message=interface_channel)
+            await view.update_message()
 
 bot.run("YOUR_BOT_TOKEN_HERE")
